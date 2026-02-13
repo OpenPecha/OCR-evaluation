@@ -3,9 +3,10 @@ Main OCR evaluation pipeline.
 
 For every model listed in eval_config.MODELS_CONFIG (or a single model
 selected via ``--model``):
-  1. Initialise the BDRC OCR pipeline.
-  2. Run inference on every benchmark image (optionally filtered by ``--batch``).
-  3. Write results to data/models/{model_name}.csv.
+  1. Detect the provider (bdrc, google_cloud_vision, gemini, deepseek).
+  2. Initialise only the backend that the model requires.
+  3. Run inference on every benchmark image (optionally filtered by ``--batch``).
+  4. Write results to data/models/{model_name}.csv.
 
 Usage
 -----
@@ -32,24 +33,171 @@ from eval_config import (
 )
 from data_pipeline import get_all_image_paths, write_model_output
 from logging_config import setup_logging
-from OCR.BDRC_models import initialize_pipeline, run_ocr_model
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
 
+# ── Provider-specific helpers ────────────────────────────────────────────────
+
+def _run_bdrc(model_name: str, settings: dict, images: list) -> list:
+    """Initialise a BDRC OCRPipeline and run inference on all images."""
+    from OCR.BDRC_models import initialize_pipeline, run_ocr_model
+
+    pipeline = initialize_pipeline(
+        model_dir=settings["model_dir"],
+        line_model_path=LINE_DETECTION_MODEL,
+        line_patch_size=LINE_DETECTION_PATCH_SIZE,
+    )
+
+    results = [None] * len(images)
+
+    def _ocr_task(idx, image_name, batch_id, image_path):
+        text = run_ocr_model(
+            image_path=str(image_path),
+            pipeline=pipeline,
+            k_factor=settings["k_factor"],
+            bbox_tolerance=settings["bbox_tolerance"],
+            merge_lines=settings["merge_lines"],
+            dewarp=settings["dewarp"],
+            encoding=settings["encoding"],
+        )
+        return idx, image_name, batch_id, text
+
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {
+            executor.submit(_ocr_task, i, name, batch, path): i
+            for i, (name, batch, path) in enumerate(images)
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"  {model_name}",
+            unit="img",
+        ):
+            idx, image_name, batch_id, text = future.result()
+            results[idx] = (image_name, batch_id, text)
+
+    return results
+
+
+def _run_google_cloud_vision(model_name: str, settings: dict, images: list) -> list:
+    """Run Google Cloud Vision TEXT_DETECTION on all images."""
+    from OCR.google_cloud_vision import run_google_vision_ocr
+
+    max_workers = settings.get("max_workers", NUM_WORKERS)
+    results = [None] * len(images)
+
+    def _ocr_task(idx, image_name, batch_id, image_path):
+        text = run_google_vision_ocr(str(image_path))
+        return idx, image_name, batch_id, text
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_ocr_task, i, name, batch, path): i
+            for i, (name, batch, path) in enumerate(images)
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"  {model_name}",
+            unit="img",
+        ):
+            idx, image_name, batch_id, text = future.result()
+            results[idx] = (image_name, batch_id, text)
+
+    return results
+
+
+def _run_gemini(model_name: str, settings: dict, images: list) -> list:
+    """Run Gemini vision model on all images."""
+    from OCR.gemini import configure_gemini, run_gemini_ocr
+
+    configure_gemini(api_key=settings["api_key"])
+    gemini_model = settings.get("model_name", "gemini-2.0-flash")
+
+    results = [None] * len(images)
+
+    def _ocr_task(idx, image_name, batch_id, image_path):
+        text = run_gemini_ocr(str(image_path), model_name=gemini_model)
+        return idx, image_name, batch_id, text
+
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {
+            executor.submit(_ocr_task, i, name, batch, path): i
+            for i, (name, batch, path) in enumerate(images)
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"  {model_name}",
+            unit="img",
+        ):
+            idx, image_name, batch_id, text = future.result()
+            results[idx] = (image_name, batch_id, text)
+
+    return results
+
+
+def _run_deepseek(model_name: str, settings: dict, images: list) -> list:
+    """Run DeepSeek vision model on all images."""
+    from OCR.deepseek import run_deepseek_ocr
+
+    api_key = settings["api_key"]
+    base_url = settings.get("base_url", "https://api.deepseek.com")
+    ds_model = settings.get("model_name", "deepseek-chat")
+
+    results = [None] * len(images)
+
+    def _ocr_task(idx, image_name, batch_id, image_path):
+        text = run_deepseek_ocr(
+            str(image_path),
+            api_key=api_key,
+            base_url=base_url,
+            model=ds_model,
+        )
+        return idx, image_name, batch_id, text
+
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {
+            executor.submit(_ocr_task, i, name, batch, path): i
+            for i, (name, batch, path) in enumerate(images)
+        }
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"  {model_name}",
+            unit="img",
+        ):
+            idx, image_name, batch_id, text = future.result()
+            results[idx] = (image_name, batch_id, text)
+
+    return results
+
+
+# ── Provider dispatch table ──────────────────────────────────────────────────
+_PROVIDERS = {
+    "bdrc": _run_bdrc,
+    "google_cloud_vision": _run_google_cloud_vision,
+    "gemini": _run_gemini,
+    "deepseek": _run_deepseek,
+}
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run BDRC OCR models over benchmark images and save inference CSVs."
+        description="Run OCR models over benchmark images and save inference CSVs."
     )
     parser.add_argument(
         "--model",
         type=str,
         default=None,
         choices=list(MODELS_CONFIG.keys()),
-        help="Run a single BDRC model by name. "
-             "If omitted, all three models are run.",
+        help="Run a single model by name. "
+             "If omitted, all configured models are run.",
     )
     parser.add_argument(
         "--batch",
@@ -66,7 +214,6 @@ def main():
     args = parse_args()
 
     # ── Resolve which models to run ──────────────────────────────────────
-    # --model is validated by argparse (choices), so we can trust it here.
     if args.model:
         models_to_run = {args.model: MODELS_CONFIG[args.model]}
     else:
@@ -93,46 +240,23 @@ def main():
         logger.info("Model: %s", model_name)
         logger.info("=" * 60)
 
-        # Initialise the pipeline for this model
-        try:
-            pipeline = initialize_pipeline(
-                model_dir=settings["model_dir"],
-                line_model_path=LINE_DETECTION_MODEL,
-                line_patch_size=LINE_DETECTION_PATCH_SIZE,
+        provider = settings.get("provider", "bdrc")
+        runner = _PROVIDERS.get(provider)
+        if runner is None:
+            logger.error(
+                "Unknown provider '%s' for model %s — skipping. "
+                "Supported providers: %s",
+                provider, model_name, ", ".join(_PROVIDERS),
             )
-        except Exception:
-            logger.exception("Failed to initialise model %s — skipping.",
-                             model_name)
             continue
 
-        # Run OCR on every image (concurrently in background threads)
-        results = [None] * len(images)
+        logger.info("Provider: %s", provider)
 
-        def _ocr_task(idx, image_name, batch_id, image_path):
-            text = run_ocr_model(
-                image_path=str(image_path),
-                pipeline=pipeline,
-                k_factor=settings["k_factor"],
-                bbox_tolerance=settings["bbox_tolerance"],
-                merge_lines=settings["merge_lines"],
-                dewarp=settings["dewarp"],
-                encoding=settings["encoding"],
-            )
-            return idx, image_name, batch_id, text
-
-        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-            futures = {
-                executor.submit(_ocr_task, i, name, batch, path): i
-                for i, (name, batch, path) in enumerate(images)
-            }
-            for future in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f"  {model_name}",
-                unit="img",
-            ):
-                idx, image_name, batch_id, text = future.result()
-                results[idx] = (image_name, batch_id, text)
+        try:
+            results = runner(model_name, settings, images)
+        except Exception:
+            logger.exception("Failed to run model %s — skipping.", model_name)
+            continue
 
         # Write to CSV
         csv_path = write_model_output(model_name, results, OUTPUT_DIR)

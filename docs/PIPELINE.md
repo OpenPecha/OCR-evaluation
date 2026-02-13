@@ -49,7 +49,6 @@ data/models/{model_name}.csv          (inference: image_name, batch_id, inferenc
     ▼  [CER_evaluation.py — CER computation]
     │
 data/evaluation/{model}_cer.csv       (per-image CER scores)
-data/evaluation/{model}_cer.json      (full results: overall, per-batch, per-image)
 data/evaluation/summary.csv           (cross-model CER comparison)
 ```
 
@@ -84,8 +83,7 @@ OCR-evaluation/
 │   │   └── Woodblock.csv
 │   └── evaluation/               # OUTPUT of Stage 3: CER results
 │       ├── summary.csv
-│       ├── {model}_cer.csv
-│       └── {model}_cer.json
+│       └── {model}_cer.csv
 │
 ├── vendor/
 │   └── tibetan-ocr-app/          # External: BDRC OCR library (Git submodule)
@@ -152,53 +150,80 @@ the raw inference text to per-model CSV files.
 ### Process Flow
 
 ```
-                        eval_config.py
-                            │
-              ┌─────────────┼──────────────────┐
-              │             │                  │
-              ▼             ▼                  ▼
-        MODELS_CONFIG   BENCHMARK_DIR      OUTPUT_DIR
-        (model settings)  (image paths)     (where to save)
-              │             │                  │
-              └─────────────┼──────────────────┘
-                            │
-                            ▼
-                      pipeline.py main()
-                            │
-              ┌─────────────┼───────────────┐
-              │             │               │
-              ▼             ▼               ▼
-        parse_args()    get_all_image_   Resolve which
-        (--model,       paths()          models to run
-         --batch)       from data_       from config
+                         eval_config.py
+                              │
+               ┌──────────────┼──────────────────┐
+               │              │                  │
+               ▼              ▼                  ▼
+         MODELS_CONFIG    BENCHMARK_DIR      OUTPUT_DIR
+         (with provider)  (image paths)      (where to save)
+               │              │                  │
+               └──────────────┼──────────────────┘
+                              │
+                              ▼
+                       pipeline.py main()
+                              │
+               ┌──────────────┼──────────────┐
+               │              │              │
+               ▼              ▼              ▼
+         parse_args()   get_all_image_   Resolve which
+         (--model,      paths()          models to run
+          --batch)      from data_       from config
                         pipeline.py
-                            │
-                            ▼
-                   For each model:
-                            │
-              ┌─────────────┤
-              │             │
-              ▼             ▼
-        initialize_     Run OCR on each image
-        pipeline()      using ThreadPoolExecutor
-        (BDRC_models.py)  (NUM_WORKERS threads)
-              │             │
-              │             ▼
-              │        run_ocr_model()
-              │          │ Read image with OpenCV
-              │          │ Run pipeline.run_ocr()
-              │          │ Join OCR lines into text
-              │          │ Return (image_name, batch_id, text)
-              │             │
-              └─────────────┘
-                            │
-                            ▼
-                   write_model_output()
-                   (data_pipeline.py)
-                            │
-                            ▼
-               data/models/{model_name}.csv
+                              │
+                              ▼
+                     For each model:
+                              │
+                     Read settings["provider"]
+                              │
+                     Look up _PROVIDERS[provider]
+                              │
+               ┌──────────────┼──────────────────────┐
+               │              │                      │
+               ▼              ▼                      ▼
+          "bdrc"     "google_cloud_vision"    "gemini" / "deepseek"
+               │              │                      │
+               ▼              ▼                      ▼
+         _run_bdrc()   _run_google_cloud_     _run_gemini() /
+               │        vision()              _run_deepseek()
+               │              │                      │
+               ▼              │                      │
+       initialize_pipeline()  │                      │
+       (BDRC_models.py)       │                      │
+       Load local ONNX        │  No local init       │  Configure API
+       model weights          │  needed — uses       │  client with
+               │              │  GOOGLE_APPLICATION_  │  API key from
+               │              │  CREDENTIALS env var  │  config
+               │              │                      │
+               └──────────────┼──────────────────────┘
+                              │
+                              ▼
+                    ThreadPoolExecutor
+                    (concurrent inference)
+                              │
+                              ▼
+                    write_model_output()
+                    (data_pipeline.py)
+                              │
+                              ▼
+                data/models/{model_name}.csv
 ```
+
+### Provider Dispatch Table
+
+The pipeline uses a dispatch table (`_PROVIDERS`) to route each model to
+the correct backend based on its `"provider"` key:
+
+| Provider | Runner Function | Initialisation | OCR Call |
+|----------|----------------|----------------|----------|
+| `"bdrc"` | `_run_bdrc()` | Loads local ONNX model + line detection | `run_ocr_model()` via BDRC OCRPipeline |
+| `"google_cloud_vision"` | `_run_google_cloud_vision()` | None (uses `GOOGLE_APPLICATION_CREDENTIALS` env var) | `run_google_vision_ocr()` |
+| `"gemini"` | `_run_gemini()` | `configure_gemini(api_key)` | `run_gemini_ocr()` |
+| `"deepseek"` | `_run_deepseek()` | None (API key passed per call) | `run_deepseek_ocr()` |
+
+Only `"bdrc"` models call `initialize_pipeline()` to load local model
+weights and the line-detection ONNX file. API-based providers skip this
+entirely and go straight to making API calls.
 
 ### Detailed Step-by-Step
 
@@ -210,20 +235,28 @@ the raw inference text to per-model CSV files.
    image file inside it. Returns a sorted list of `(image_name, batch_id,
    image_path)` tuples.
 
-3. **Model initialisation** — For each model in `MODELS_CONFIG`:
-   - `initialize_pipeline()` loads the OCR model weights from the model
-     directory and the line-detection ONNX model.
-   - Builds a BDRC `OCRPipeline` object ready for inference.
+3. **Provider dispatch** — For each model in `MODELS_CONFIG`:
+   - Read `settings["provider"]` (defaults to `"bdrc"` if missing).
+   - Look up the matching runner function from `_PROVIDERS`.
+   - If the provider is unknown, log an error and skip the model.
 
-4. **Concurrent inference** — Images are processed in parallel using
-   `ThreadPoolExecutor` (default 4 workers). For each image:
-   - `cv2.imread()` loads the image.
-   - `pipeline.run_ocr()` performs line detection, text recognition, and
-     optional dewarping.
-   - Recognised lines are joined with `\n` into a single text string.
-   - A `tqdm` progress bar tracks completion.
+4. **Model initialisation (provider-specific)**:
+   - **BDRC:** `initialize_pipeline()` loads the OCR model weights from
+     the model directory and the line-detection ONNX model. Builds a BDRC
+     `OCRPipeline` object ready for inference.
+   - **Google Cloud Vision:** No initialisation — the client is lazily
+     created on first API call. Requires `GOOGLE_APPLICATION_CREDENTIALS`.
+   - **Gemini:** Calls `configure_gemini()` with the API key from config.
+   - **DeepSeek:** No initialisation — API key is passed per request.
 
-5. **CSV output** — `write_model_output()` writes results to
+5. **Concurrent inference** — Images are processed in parallel using
+   `ThreadPoolExecutor` (default `NUM_WORKERS=4` threads). Each provider's
+   runner function manages its own thread pool with the same pattern:
+   - Submit one `_ocr_task` per image.
+   - Collect results in a pre-allocated indexed list.
+   - `tqdm` progress bar tracks completion.
+
+6. **CSV output** — `write_model_output()` writes results to
    `data/models/{model_name}.csv` using `csv.writer` for proper escaping.
 
 ### Concurrency Model
@@ -277,7 +310,7 @@ data/benchmark/benchmark.csv          data/models/{model}.csv
                        │
                        ▼
               _normalise() both strings
-              (strip + collapse whitespace)
+              (optional — see CLI flags below)
                        │
                        ▼
               compute_cer(inference, reference)
@@ -293,16 +326,15 @@ data/benchmark/benchmark.csv          data/models/{model}.csv
       save_evaluation()   save_summary()
               │                 │
               ▼                 ▼
-    {model}_cer.json      summary.csv
-    {model}_cer.csv       (all models compared)
+    {model}_cer.csv       summary.csv
+                          (all models compared)
 ```
 
 ### Output Files
 
 | File | Contents |
 |------|----------|
-| `{model}_cer.json` | Full results: overall CER, per-batch CER (with counts), per-image CER |
-| `{model}_cer.csv` | Flat CSV of per-image CER for easy inspection / plotting |
+| `{model}_cer.csv` | Per-image CER scores (image_name, batch_id, cer) |
 | `summary.csv` | One row per model with overall CER and per-batch CER columns |
 
 (See [CER_EVALUATION.md](CER_EVALUATION.md) for a detailed analysis of
@@ -329,16 +361,51 @@ All configuration lives in `src/OCR-evaluation/eval_config.py`.
 
 ### MODELS_CONFIG Structure
 
-Each model entry contains:
+Every model entry **must** include a `"provider"` key that tells the
+pipeline which OCR backend to use. The remaining keys depend on the provider.
+
+**BDRC models** (provider: `"bdrc"`):
 
 ```python
-"Model_Name": {
-    "model_dir": str,        # Path to model weights directory
-    "k_factor": float,       # Line-detection sensitivity
-    "bbox_tolerance": float,  # Bounding box merging tolerance
-    "encoding": str,          # "unicode" or "wylie"
-    "merge_lines": bool,      # Whether to merge detected lines
-    "dewarp": bool,           # Whether to apply TPS dewarping
+"Ume_Druma": {
+    "provider": "bdrc",          # ← required: selects the BDRC backend
+    "model_dir": str,            # Path to model weights directory
+    "k_factor": float,           # Line-detection sensitivity
+    "bbox_tolerance": float,     # Bounding box merging tolerance
+    "encoding": str,             # "unicode" or "wylie"
+    "merge_lines": bool,         # Whether to merge detected lines
+    "dewarp": bool,              # Whether to apply TPS dewarping
+}
+```
+
+**Google Cloud Vision** (provider: `"google_cloud_vision"`):
+
+```python
+"Google_Vision": {
+    "provider": "google_cloud_vision",
+    "max_workers": 4,            # Concurrent API calls
+    # Requires: GOOGLE_APPLICATION_CREDENTIALS env var
+}
+```
+
+**Gemini** (provider: `"gemini"`):
+
+```python
+"Gemini": {
+    "provider": "gemini",
+    "api_key": os.environ.get("GEMINI_API_KEY", ""),
+    "model_name": "gemini-2.0-flash",
+}
+```
+
+**DeepSeek** (provider: `"deepseek"`):
+
+```python
+"DeepSeek": {
+    "provider": "deepseek",
+    "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+    "base_url": "https://api.deepseek.com",
+    "model_name": "deepseek-chat",
 }
 ```
 
@@ -371,21 +438,7 @@ Same structure as benchmark.csv but with `inference` instead of `transcript`.
 ```csv
 image_name,batch_id,cer
 08430009.png,batch-1,0.057297
-```
-
-### {model}_cer.json (Full Results)
-
-```json
-{
-  "model": "Woodblock",
-  "overall_cer": 0.31588,
-  "per_batch": {
-    "batch-1": { "cer": 0.207804, "count": 44 }
-  },
-  "per_image": [
-    { "image_name": "08430009.png", "batch_id": "batch-1", "cer": 0.057297 }
-  ]
-}
+37080031.tif,batch-1,0.555894
 ```
 
 ### summary.csv (Cross-Model Comparison)
@@ -419,7 +472,7 @@ python pipeline.py --model Woodblock
 python pipeline.py --model Ume_Druma --batch batch-1
 ```
 
-### Evaluate all models
+### Evaluate all models (raw comparison — no normalisation)
 
 ```bash
 python CER_evaluation.py
@@ -430,6 +483,34 @@ python CER_evaluation.py
 ```bash
 python CER_evaluation.py --model Woodblock
 ```
+
+### Evaluate with whitespace normalisation
+
+Strip leading/trailing whitespace and collapse internal runs to a single
+space before computing CER:
+
+```bash
+python CER_evaluation.py --normalize-whitespace
+```
+
+### Evaluate with Unicode normalisation
+
+Apply a Unicode normalisation form (NFC, NFD, NFKC, or NFKD) to both
+inference and reference before computing CER.  Useful when different OCR
+engines return the same visual characters in different decomposition forms:
+
+```bash
+python CER_evaluation.py --normalize-unicode NFC
+```
+
+### Combine both normalisation options
+
+```bash
+python CER_evaluation.py --normalize-whitespace --normalize-unicode NFC
+```
+
+> **Note:** If neither `--normalize-whitespace` nor `--normalize-unicode`
+> is given, CER is computed on the raw text with **no normalisation at all**.
 
 ### Reformat existing CSVs (fix quoting issues)
 

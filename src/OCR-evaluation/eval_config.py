@@ -3,8 +3,20 @@ Configuration for the OCR evaluation pipeline.
 
 Defines paths to the tibetan-ocr-app, OCR models, line detection model,
 benchmark data, output directory, and per-model OCR settings.
+
+Every model entry in MODELS_CONFIG must include a ``"provider"`` key that
+tells the pipeline which OCR backend to use:
+
+    - ``"bdrc"``               → local BDRC OCRPipeline
+    - ``"google_cloud_vision"`` → Google Cloud Vision API
+    - ``"gemini"``             → Google Gemini API
+    - ``"deepseek"``           → DeepSeek vision API
+
+Only BDRC models require the line-detection model and local model weights.
+API-based models need credentials via environment variables.
 """
 
+import os
 from pathlib import Path
 
 # ── Project root (two levels up from this file) ──────────────────────────────
@@ -35,9 +47,16 @@ OUTPUT_DIR = PROJECT_ROOT / "data" / "models"
 
 # ── Per-model OCR settings ───────────────────────────────────────────────────
 # Each key becomes the output CSV filename: data/models/{key}.csv
-# "model_dir" is relative to OCR_MODELS_DIR.
+#
+# "provider" determines which OCR backend is used:
+#   - "bdrc"                → local BDRC model (requires model_dir + line detection)
+#   - "google_cloud_vision" → Google Cloud Vision TEXT_DETECTION API
+#   - "gemini"              → Google Gemini vision model
+#   - "deepseek"            → DeepSeek vision model (OpenAI-compatible API)
 MODELS_CONFIG = {
+    # ── BDRC local models ────────────────────────────────────────────────
     "Ume_Druma": {
+        "provider": "bdrc",
         "model_dir": str(OCR_MODELS_DIR / "Ume_Druma"),
         "k_factor": 2.5,
         "bbox_tolerance": 4.0,
@@ -46,6 +65,7 @@ MODELS_CONFIG = {
         "dewarp": False,
     },
     "Ume_Petsuk": {
+        "provider": "bdrc",
         "model_dir": str(OCR_MODELS_DIR / "Ume_Petsuk"),
         "k_factor": 2.5,
         "bbox_tolerance": 4.0,
@@ -54,6 +74,7 @@ MODELS_CONFIG = {
         "dewarp": False,
     },
     "Woodblock": {
+        "provider": "bdrc",
         "model_dir": str(OCR_MODELS_DIR / "Woodblock"),
         "k_factor": 2.5,
         "bbox_tolerance": 4.0,
@@ -61,4 +82,21 @@ MODELS_CONFIG = {
         "merge_lines": True,
         "dewarp": False,
     },
+    # ── API-based models (uncomment to enable) ───────────────────────────
+    # "Google_Vision": {
+    #     "provider": "google_cloud_vision",
+    #     # Requires: GOOGLE_APPLICATION_CREDENTIALS env var
+    #     "max_workers": 4,
+    # },
+    # "Gemini": {
+    #     "provider": "gemini",
+    #     "api_key": os.environ.get("GEMINI_API_KEY", ""),
+    #     "model_name": "gemini-2.0-flash",
+    # },
+    # "DeepSeek": {
+    #     "provider": "deepseek",
+    #     "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+    #     "base_url": "https://api.deepseek.com",
+    #     "model_name": "deepseek-chat",
+    # },
 }

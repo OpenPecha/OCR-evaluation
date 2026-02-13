@@ -3,7 +3,6 @@ Tests for CER_evaluation.py — edit distance, CER computation, normalisation,
 loading helpers, and end-to-end evaluation logic.
 """
 
-import json
 import logging
 from pathlib import Path
 
@@ -106,21 +105,55 @@ class TestComputeCER:
 # ── _normalise ───────────────────────────────────────────────────────────────
 
 class TestNormalise:
-    def test_strips_whitespace(self):
-        assert _normalise("  hello world  ") == "hello world"
+    """Tests for the configurable _normalise() function."""
 
-    def test_collapses_whitespace(self):
-        assert _normalise("hello   \t  world") == "hello world"
+    # ── Default behaviour (no normalisation) ─────────────────────────────
+    def test_default_no_change(self):
+        """With no flags, text is returned unchanged."""
+        assert _normalise("  hello world  ") == "  hello world  "
 
-    def test_empty_string(self):
+    def test_default_preserves_newlines(self):
+        assert _normalise("line1\n  line2\n") == "line1\n  line2\n"
+
+    def test_default_empty_string(self):
         assert _normalise("") == ""
 
-    def test_already_clean(self):
-        assert _normalise("hello world") == "hello world"
+    # ── Whitespace normalisation ─────────────────────────────────────────
+    def test_whitespace_strips(self):
+        assert _normalise("  hello world  ", whitespace=True) == "hello world"
 
-    def test_newlines(self):
-        logger.info("Testing normalisation of newlines")
-        assert _normalise("line1\n  line2\n") == "line1 line2"
+    def test_whitespace_collapses(self):
+        assert _normalise("hello   \t  world", whitespace=True) == "hello world"
+
+    def test_whitespace_newlines(self):
+        logger.info("Testing whitespace normalisation of newlines")
+        assert _normalise("line1\n  line2\n", whitespace=True) == "line1 line2"
+
+    def test_whitespace_already_clean(self):
+        assert _normalise("hello world", whitespace=True) == "hello world"
+
+    # ── Unicode normalisation ────────────────────────────────────────────
+    def test_unicode_nfc(self):
+        import unicodedata
+        # é as NFD (e + combining acute) → NFC should compose it
+        nfd = unicodedata.normalize("NFD", "é")
+        assert _normalise(nfd, unicode_form="NFC") == "é"
+
+    def test_unicode_nfkc(self):
+        # ﬁ (LATIN SMALL LIGATURE FI) → fi under NFKC
+        assert _normalise("\ufb01", unicode_form="NFKC") == "fi"
+
+    def test_unicode_none_leaves_unchanged(self):
+        import unicodedata
+        nfd = unicodedata.normalize("NFD", "é")
+        assert _normalise(nfd, unicode_form=None) == nfd
+
+    # ── Both flags together ──────────────────────────────────────────────
+    def test_combined(self):
+        import unicodedata
+        nfd = unicodedata.normalize("NFD", "  hé  llo  ")
+        result = _normalise(nfd, whitespace=True, unicode_form="NFC")
+        assert result == "hé llo"
 
 
 # ── load_benchmark ───────────────────────────────────────────────────────────
@@ -232,8 +265,8 @@ class TestEvaluateModel:
 # ── save_evaluation / save_summary ───────────────────────────────────────────
 
 class TestSaveResults:
-    def test_save_evaluation_creates_files(self, tmp_output):
-        logger.info("Testing save_evaluation output files")
+    def test_save_evaluation_creates_csv(self, tmp_output):
+        logger.info("Testing save_evaluation output file")
         result = {
             "model": "test_model",
             "overall_cer": 0.123,
@@ -243,17 +276,17 @@ class TestSaveResults:
                 {"image_name": "b.png", "batch_id": "b1", "cer": 0.15},
             ],
         }
-        json_path, csv_path = save_evaluation(result, tmp_output)
+        csv_path = save_evaluation(result, tmp_output)
 
-        assert json_path.exists()
         assert csv_path.exists()
+        assert csv_path.suffix == ".csv"
 
-        # Verify JSON content
-        with open(json_path) as f:
-            data = json.load(f)
-        assert data["model"] == "test_model"
-        assert data["overall_cer"] == 0.123
-        logger.info("Saved evaluation JSON verified at %s", json_path)
+        # Verify CSV content
+        df = pd.read_csv(csv_path)
+        assert len(df) == 2
+        assert list(df.columns) == ["image_name", "batch_id", "cer"]
+        assert df["cer"].iloc[0] == 0.1
+        logger.info("Saved evaluation CSV verified at %s", csv_path)
 
     def test_save_summary_creates_csv(self, tmp_output):
         logger.info("Testing save_summary")

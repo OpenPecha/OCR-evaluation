@@ -8,12 +8,14 @@ CER = edit_distance(inference, reference) / len(reference)
 
 Usage
 -----
-    python CER_evaluation.py                 # evaluate all models
-    python CER_evaluation.py --model Modern  # evaluate a single model
+    python CER_evaluation.py                                 # all models, no normalisation
+    python CER_evaluation.py --model Modern                  # single model, no normalisation
+    python CER_evaluation.py --normalize-whitespace          # collapse whitespace before CER
+    python CER_evaluation.py --normalize-unicode NFC         # Unicode NFC before CER
+    python CER_evaluation.py --normalize-whitespace --normalize-unicode NFC  # both
 """
 
 import argparse
-import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -68,16 +70,40 @@ def compute_cer(inference: str, reference: str) -> float:
 
 
 # ── Normalisation ────────────────────────────────────────────────────────────
-def _normalise(text: str) -> str:
+def _normalise(
+    text: str,
+    *,
+    whitespace: bool = False,
+    unicode_form: str | None = None,
+) -> str:
     """
-    Minimal text normalisation applied to *both* reference and inference before
-    CER computation so that trivial whitespace differences don't dominate the
-    error rate.
+    Optional text normalisation applied to *both* reference and inference
+    before CER computation.
 
-    * Strip leading / trailing whitespace.
-    * Collapse runs of whitespace to a single space.
+    Parameters
+    ----------
+    text : str
+        The raw text to normalise.
+    whitespace : bool, optional
+        If *True*, strip leading / trailing whitespace and collapse runs of
+        whitespace to a single space.  **Default: False** (no whitespace
+        normalisation).
+    unicode_form : str or None, optional
+        If set to one of ``"NFC"``, ``"NFD"``, ``"NFKC"``, ``"NFKD"``,
+        apply the corresponding Unicode normalisation form.
+        **Default: None** (no Unicode normalisation).
+
+    Returns
+    -------
+    str
+        The (possibly unchanged) text.
     """
-    return " ".join(text.split())
+    if unicode_form is not None:
+        import unicodedata
+        text = unicodedata.normalize(unicode_form, text)
+    if whitespace:
+        text = " ".join(text.split())
+    return text
 
 
 # ── Loading helpers ──────────────────────────────────────────────────────────
@@ -124,15 +150,29 @@ def evaluate_model(
     model_name: str,
     model_csv: Path,
     benchmark: Dict[Tuple[str, str], str],
+    **kwargs,
 ) -> Dict:
     """
     Evaluate a single model against the benchmark.
 
-    Returns a dict with:
-    - ``model``: model name
-    - ``overall_cer``: macro-average CER over all images
-    - ``per_batch``: ``{batch_id: {"cer": float, "count": int}}``
-    - ``per_image``: list of ``{"image_name", "batch_id", "cer"}``
+    Parameters
+    ----------
+    model_name : str
+        Human-readable model name.
+    model_csv : Path
+        Path to the model's inference CSV.
+    benchmark : dict
+        Ground-truth lookup ``(image_name, batch_id) → transcript``.
+    **kwargs
+        Optional normalisation flags forwarded to ``_normalise()``:
+
+        - ``normalize_whitespace`` (bool): strip / collapse whitespace.
+        - ``normalize_unicode`` (str | None): Unicode form, e.g. ``"NFC"``.
+
+    Returns
+    -------
+    dict
+        ``model``, ``overall_cer``, ``per_batch``, ``per_image``.
     """
     inferences = load_model_csv(model_csv)
 
@@ -140,11 +180,22 @@ def evaluate_model(
     raw_cers: List[float] = []               # keep unrounded for aggregation
     batch_accum: Dict[str, List[float]] = {}
 
+    norm_ws = kwargs.get("normalize_whitespace", False)
+    norm_uc = kwargs.get("normalize_unicode", None)
+
     for image_name, batch_id, inference_text in inferences:
         reference = benchmark.get((image_name, batch_id), "")
         cer = compute_cer(
-            _normalise(inference_text if pd.notna(inference_text) else ""),
-            _normalise(reference if pd.notna(reference) else ""),
+            _normalise(
+                inference_text if pd.notna(inference_text) else "",
+                whitespace=norm_ws,
+                unicode_form=norm_uc,
+            ),
+            _normalise(
+                reference if pd.notna(reference) else "",
+                whitespace=norm_ws,
+                unicode_form=norm_uc,
+            ),
         )
         per_image.append({
             "image_name": image_name,
@@ -174,29 +225,25 @@ def evaluate_model(
     }
 
 
-def save_evaluation(result: Dict, output_dir: Path) -> Tuple[Path, Path]:
+def save_evaluation(result: Dict, output_dir: Path) -> Path:
     """
-    Persist evaluation results.
+    Persist evaluation results to a single CSV file.
 
-    Writes:
-    - ``{output_dir}/{model}_cer.json``  – full results (overall + per-batch + per-image)
-    - ``{output_dir}/{model}_cer.csv``   – per-image CER for easy inspection
+    Writes ``{output_dir}/{model}_cer.csv`` with columns:
+    ``image_name``, ``batch_id``, ``cer``, plus a header comment line
+    containing the overall CER.
 
-    Returns the paths of both files.
+    Returns the path of the written file.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     model = result["model"]
 
-    json_path = output_dir / f"{model}_cer.json"
     csv_path = output_dir / f"{model}_cer.csv"
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
 
     df = pd.DataFrame(result["per_image"])
     df.to_csv(csv_path, index=False)
 
-    return json_path, csv_path
+    return csv_path
 
 
 def save_summary(all_results: List[Dict], output_dir: Path) -> Path:
@@ -234,12 +281,40 @@ def main():
         help="Evaluate a single model (by name). If omitted, all models in "
              "data/models/ are evaluated.",
     )
+    parser.add_argument(
+        "--normalize-whitespace",
+        action="store_true",
+        default=False,
+        help="Strip leading/trailing whitespace and collapse runs of "
+             "whitespace to a single space before computing CER. "
+             "Off by default.",
+    )
+    parser.add_argument(
+        "--normalize-unicode",
+        type=str,
+        default=None,
+        choices=["NFC", "NFD", "NFKC", "NFKD"],
+        help="Apply a Unicode normalisation form (NFC, NFD, NFKC, NFKD) to "
+             "both inference and reference before computing CER. "
+             "Off by default.",
+    )
     args = parser.parse_args()
 
     # Load ground-truth benchmark
     logger.info("Loading benchmark from %s", BENCHMARK_CSV)
     benchmark = load_benchmark(BENCHMARK_CSV)
     logger.info("Benchmark contains %d entries", len(benchmark))
+
+    # Log normalisation settings
+    norm_kwargs = {}
+    if args.normalize_whitespace:
+        norm_kwargs["normalize_whitespace"] = True
+        logger.info("Whitespace normalisation: ON")
+    if args.normalize_unicode:
+        norm_kwargs["normalize_unicode"] = args.normalize_unicode
+        logger.info("Unicode normalisation: %s", args.normalize_unicode)
+    if not norm_kwargs:
+        logger.info("Text normalisation: OFF (raw comparison)")
 
     # Discover model CSVs
     if args.model:
@@ -263,11 +338,11 @@ def main():
     all_results: List[Dict] = []
     for model_name, csv_path in model_csvs:
         logger.info("Evaluating model: %s", model_name)
-        result = evaluate_model(model_name, csv_path, benchmark)
-        json_path, cer_csv = save_evaluation(result, EVALUATION_DIR)
+        result = evaluate_model(model_name, csv_path, benchmark, **norm_kwargs)
+        cer_csv = save_evaluation(result, EVALUATION_DIR)
         all_results.append(result)
         logger.info(
-            "  Overall CER: %.4f  →  %s", result["overall_cer"], json_path
+            "  Overall CER: %.4f  →  %s", result["overall_cer"], cer_csv
         )
         for bid, stats in sorted(result["per_batch"].items()):
             logger.info(
