@@ -1,0 +1,12 @@
+numpy
+opencv-python
+onnxruntime
+scipy>=1.14.1
+Pillow
+pandas>=2.2.3
+pyctcdecode
+pyewts
+thin-plate-spline
+PySide6
+tqdm
+pytest
