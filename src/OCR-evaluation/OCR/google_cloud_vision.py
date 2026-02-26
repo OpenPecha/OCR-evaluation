@@ -1,8 +1,9 @@
 """
 Google Cloud Vision OCR integration.
 
-Provides a thin wrapper around the Cloud Vision TEXT_DETECTION API so that it
-can be used interchangeably with the BDRC pipeline in the evaluation harness.
+Provides a thin wrapper around the Cloud Vision DOCUMENT_TEXT_DETECTION API
+(with Tibetan language hint) so that it can be used interchangeably with the
+BDRC pipeline in the evaluation harness.
 
 Prerequisites
 -------------
@@ -15,11 +16,15 @@ Usage
 -----
     from OCR.google_cloud_vision import run_google_vision_ocr
 
-    text = run_google_vision_ocr("path/to/image.jpg")
+    text, raw = run_google_vision_ocr("path/to/image.jpg")
 """
 
+import io
 import logging
 from pathlib import Path
+from typing import Tuple
+
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +52,27 @@ def _get_client() -> "vision.ImageAnnotatorClient":
     return _get_client._client  # type: ignore[attr-defined]
 
 
-def run_google_vision_ocr(image_path: str) -> str:
+# Formats the Cloud Vision API accepts natively (no conversion needed).
+_VISION_SUPPORTED = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff", ".pdf",
+}
+
+
+def _load_image_bytes(path: Path) -> bytes:
+    """Read image bytes, converting to PNG if the format is not natively supported."""
+    if path.suffix.lower() in _VISION_SUPPORTED:
+        with open(path, "rb") as f:
+            return f.read()
+    logger.debug("Converting %s to PNG for Vision API compatibility", path.name)
+    img = Image.open(path)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def run_google_vision_ocr(image_path: str) -> Tuple[str, dict]:
     """
-    Run Google Cloud Vision TEXT_DETECTION on a single image.
+    Run Google Cloud Vision DOCUMENT_TEXT_DETECTION on a single image.
 
     Parameters
     ----------
@@ -58,41 +81,50 @@ def run_google_vision_ocr(image_path: str) -> str:
 
     Returns
     -------
-    str
-        The full detected text (``full_text_annotation.text``), or an empty
-        string when no text is found or an error occurs.
+    tuple of (str, dict)
+        A pair of (detected_text, raw_response_dict).
+        ``detected_text`` is the full detected text
+        (``full_text_annotation.text``), or an empty string when no text is
+        found or an error occurs.
+        ``raw_response_dict`` is the full API response serialized as a dict,
+        or an empty dict on failure.
     """
+    from google.protobuf.json_format import MessageToDict
+
     path = Path(image_path)
     if not path.exists():
         logger.warning("Image file does not exist: %s", image_path)
-        return ""
+        return "", {}
 
     client = _get_client()
-
-    with open(path, "rb") as f:
-        content = f.read()
+    content = _load_image_bytes(path)
 
     image = vision.Image(content=content)  # type: ignore[union-attr]
+    image_context = vision.ImageContext(language_hints=["bo"])  # type: ignore[union-attr]
 
     try:
-        response = client.text_detection(image=image)
+        response = client.document_text_detection(
+            image=image,
+            image_context=image_context,
+        )
     except Exception:
         logger.exception("Google Cloud Vision API call failed for %s", image_path)
-        return ""
+        return "", {}
+
+    raw_dict = MessageToDict(response._pb)
 
     if response.error.message:
         logger.error(
             "Vision API error for %s: %s", image_path, response.error.message
         )
-        return ""
+        return "", raw_dict
 
-    if not response.text_annotations:
+    annotation = response.full_text_annotation
+    if not annotation or not annotation.text:
         logger.info("No text detected in %s", image_path)
-        return ""
+        return "", raw_dict
 
-    # The first annotation contains the full concatenated text
-    full_text = response.text_annotations[0].description
-    return full_text.strip()
+    return annotation.text.strip(), raw_dict
 
 
 def run_google_vision_ocr_batch(
@@ -113,7 +145,7 @@ def run_google_vision_ocr_batch(
     Returns
     -------
     dict
-        Mapping ``{image_path: detected_text}``.
+        Mapping ``{image_path: (detected_text, raw_response_dict)}``.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -128,5 +160,5 @@ def run_google_vision_ocr_batch(
                 results[img_path] = future.result()
             except Exception:
                 logger.exception("OCR failed for %s", img_path)
-                results[img_path] = ""
+                results[img_path] = ("", {})
     return results

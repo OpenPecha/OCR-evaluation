@@ -45,6 +45,12 @@ BENCHMARK_CSV = BENCHMARK_DIR / "benchmark.csv"
 # ── Output directory for per-model inference CSVs ────────────────────────────
 OUTPUT_DIR = PROJECT_ROOT / "data" / "models"
 
+# ── Raw Google Vision API responses (gzipped JSON per image) ─────────────────
+GOOGLE_VISION_RAW_DIR = PROJECT_ROOT / "data" / "google_vision_raw"
+
+# ── Raw Gemini OCR text output (one .txt per image) ─────────────────────────
+GEMINI_RAW_DIR = PROJECT_ROOT / "data" / "gemini_raw"
+
 # ── Per-model OCR settings ───────────────────────────────────────────────────
 # Each key becomes the output CSV filename: data/models/{key}.csv
 #
@@ -82,17 +88,38 @@ MODELS_CONFIG = {
         "merge_lines": True,
         "dewarp": False,
     },
-    # ── API-based models (uncomment to enable) ───────────────────────────
-    # "Google_Vision": {
-    #     "provider": "google_cloud_vision",
-    #     # Requires: GOOGLE_APPLICATION_CREDENTIALS env var
-    #     "max_workers": 4,
-    # },
-    # "Gemini": {
-    #     "provider": "gemini",
-    #     "api_key": os.environ.get("GEMINI_API_KEY", ""),
-    #     "model_name": "gemini-2.0-flash",
-    # },
+    # ── API-based models ────────────────────────────────────────────────
+    "Google_Vision": {
+        "provider": "google_cloud_vision",
+        "max_workers": 4,
+    },
+    # ── Gemini models ────────────────────────────────────────────────────
+    "Gemini_2_Flash": {
+        "provider": "gemini",
+        "api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "model_name": "gemini-2.0-flash",
+    },
+    "Gemini_2.5_Flash": {
+        "provider": "gemini",
+        "api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "model_name": "gemini-2.5-flash",
+    },
+    "Gemini_3_Flash": {
+        "provider": "gemini",
+        "api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "model_name": "gemini-3-flash-preview",
+    },
+    "Gemini_3_Pro": {
+        "provider": "gemini",
+        "api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "model_name": "gemini-3-pro-preview",
+    },
+    "Gemini_Prompt_3_Flash": {
+        "provider": "gemini",
+        "api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "model_name": "gemini-3-flash-preview",
+        "use_structured_prompt": True,
+    },
     # "DeepSeek": {
     #     "provider": "deepseek",
     #     "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),

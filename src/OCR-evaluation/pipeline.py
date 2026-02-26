@@ -25,6 +25,8 @@ from tqdm import tqdm
 
 from eval_config import (
     BENCHMARK_DIR,
+    GEMINI_RAW_DIR,
+    GOOGLE_VISION_RAW_DIR,
     LINE_DETECTION_MODEL,
     LINE_DETECTION_PATCH_SIZE,
     MODELS_CONFIG,
@@ -82,20 +84,60 @@ def _run_bdrc(model_name: str, settings: dict, images: list) -> list:
 
 
 def _run_google_cloud_vision(model_name: str, settings: dict, images: list) -> list:
-    """Run Google Cloud Vision TEXT_DETECTION on all images."""
+    """Run Google Cloud Vision TEXT_DETECTION on all images.
+
+    In addition to returning transcript results, saves each raw API response
+    as a gzipped JSON file under GOOGLE_VISION_RAW_DIR/{batch_id}/.
+    If the gzipped JSON already exists for an image, the cached text is
+    reused and the API call is skipped.
+    """
+    import gzip
+    import json
+    from pathlib import Path
+
     from OCR.google_cloud_vision import run_google_vision_ocr
 
     max_workers = settings.get("max_workers", NUM_WORKERS)
     results = [None] * len(images)
+    pending = []
+
+    # Reuse cached results where a raw response file already exists
+    for i, (name, batch, path) in enumerate(images):
+        stem = Path(name).stem
+        gz_path = GOOGLE_VISION_RAW_DIR / batch / f"{stem}.json.gz"
+        if gz_path.exists():
+            with gzip.open(gz_path, "rt", encoding="utf-8") as f:
+                raw_dict = json.load(f)
+            text = (
+                raw_dict
+                .get("fullTextAnnotation", {})
+                .get("text", "")
+                .strip()
+            )
+            results[i] = (name, batch, text)
+        else:
+            pending.append((i, name, batch, path))
+
+    cached_count = len(images) - len(pending)
+    if cached_count:
+        logger.info(
+            "  %s: reusing %d cached results, %d to OCR",
+            model_name, cached_count, len(pending),
+        )
+
+    if not pending:
+        return results
+
+    raw_responses = []
 
     def _ocr_task(idx, image_name, batch_id, image_path):
-        text = run_google_vision_ocr(str(image_path))
-        return idx, image_name, batch_id, text
+        text, raw_dict = run_google_vision_ocr(str(image_path))
+        return idx, image_name, batch_id, text, raw_dict
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(_ocr_task, i, name, batch, path): i
-            for i, (name, batch, path) in enumerate(images)
+            for i, name, batch, path in pending
         }
         for future in tqdm(
             as_completed(futures),
@@ -103,29 +145,105 @@ def _run_google_cloud_vision(model_name: str, settings: dict, images: list) -> l
             desc=f"  {model_name}",
             unit="img",
         ):
-            idx, image_name, batch_id, text = future.result()
+            idx, image_name, batch_id, text, raw_dict = future.result()
             results[idx] = (image_name, batch_id, text)
+            raw_responses.append((image_name, batch_id, raw_dict))
+
+    for image_name, batch_id, raw_dict in raw_responses:
+        batch_dir = GOOGLE_VISION_RAW_DIR / batch_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(image_name).stem
+        gz_path = batch_dir / f"{stem}.json.gz"
+        with gzip.open(gz_path, "wt", encoding="utf-8") as f:
+            json.dump(raw_dict, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        "Saved %d new raw responses → %s", len(raw_responses), GOOGLE_VISION_RAW_DIR
+    )
 
     return results
 
 
 def _run_gemini(model_name: str, settings: dict, images: list) -> list:
-    """Run Gemini vision model on all images."""
-    from OCR.gemini import configure_gemini, run_gemini_ocr
+    """Run Gemini vision model on all images.
 
-    configure_gemini(api_key=settings["api_key"])
+    Saves each OCR result as a plain-text file under
+    GEMINI_RAW_DIR/{model_name}/{batch_id}/{stem}.txt.
+    If the text file already exists, its contents are reused and the API
+    call is skipped.
+
+    When ``settings["use_structured_prompt"]`` is True, uses the structured
+    prompt from ``gemini_prompt.py`` instead.  Raw JSON is saved as
+    ``.json`` files alongside the text cache.
+    """
+    import json
+    from pathlib import Path
+
+    use_structured = settings.get("use_structured_prompt", False)
+
+    if use_structured:
+        from OCR.gemini import configure_gemini, run_gemini_ocr_structured
+        from OCR.gemini_prompt import TibetanManuscript
+    else:
+        from OCR.gemini import configure_gemini, run_gemini_ocr
+
     gemini_model = settings.get("model_name", "gemini-2.0-flash")
+    raw_base = GEMINI_RAW_DIR / model_name
 
     results = [None] * len(images)
+    pending = []
 
-    def _ocr_task(idx, image_name, batch_id, image_path):
-        text = run_gemini_ocr(str(image_path), model_name=gemini_model)
-        return idx, image_name, batch_id, text
+    for i, (name, batch, path) in enumerate(images):
+        stem = Path(name).stem
+        if use_structured:
+            json_path = raw_base / batch / f"{stem}.json"
+            if json_path.exists():
+                raw_json = json_path.read_text(encoding="utf-8")
+                try:
+                    manuscript = TibetanManuscript.model_validate_json(raw_json)
+                    text = "\n".join(
+                        line.raw_transcription for line in manuscript.lines
+                    )
+                except Exception:
+                    text = raw_json
+                results[i] = (name, batch, text)
+            else:
+                pending.append((i, name, batch, path))
+        else:
+            txt_path = raw_base / batch / f"{stem}.txt"
+            if txt_path.exists():
+                text = txt_path.read_text(encoding="utf-8")
+                results[i] = (name, batch, text)
+            else:
+                pending.append((i, name, batch, path))
+
+    cached_count = len(images) - len(pending)
+    if cached_count:
+        logger.info(
+            "  %s: reusing %d cached results, %d to OCR",
+            model_name, cached_count, len(pending),
+        )
+
+    if not pending:
+        return results
+
+    configure_gemini(api_key=settings["api_key"])
+
+    if use_structured:
+        def _ocr_task(idx, image_name, batch_id, image_path):
+            raw_json, text = run_gemini_ocr_structured(
+                str(image_path), model_name=gemini_model,
+            )
+            return idx, image_name, batch_id, text, raw_json
+    else:
+        def _ocr_task(idx, image_name, batch_id, image_path):
+            text = run_gemini_ocr(str(image_path), model_name=gemini_model)
+            return idx, image_name, batch_id, text, None
 
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
         futures = {
             executor.submit(_ocr_task, i, name, batch, path): i
-            for i, (name, batch, path) in enumerate(images)
+            for i, name, batch, path in pending
         }
         for future in tqdm(
             as_completed(futures),
@@ -133,8 +251,23 @@ def _run_gemini(model_name: str, settings: dict, images: list) -> list:
             desc=f"  {model_name}",
             unit="img",
         ):
-            idx, image_name, batch_id, text = future.result()
+            idx, image_name, batch_id, text, raw_json = future.result()
             results[idx] = (image_name, batch_id, text)
+
+            stem = Path(image_name).stem
+            out_dir = raw_base / batch_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            if use_structured and raw_json:
+                json_path = out_dir / f"{stem}.json"
+                json_path.write_text(raw_json, encoding="utf-8")
+            else:
+                txt_path = out_dir / f"{stem}.txt"
+                txt_path.write_text(text, encoding="utf-8")
+
+    logger.info(
+        "Saved %d raw output files → %s", len(pending), raw_base,
+    )
 
     return results
 

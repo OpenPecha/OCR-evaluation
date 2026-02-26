@@ -9,4 +9,6 @@ pyewts
 thin-plate-spline
 PySide6
 tqdm
+google-genai
+pydantic
 pytest
